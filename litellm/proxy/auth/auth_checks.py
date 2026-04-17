@@ -3089,13 +3089,31 @@ async def _check_team_member_budget(
             proxy_logging_obj=proxy_logging_obj,
         )
 
-        if (
-            team_membership is not None
-            and team_membership.litellm_budget_table is not None
-            and team_membership.litellm_budget_table.max_budget is not None
-        ):
+        # Per-member override wins; otherwise fall back to the team-level
+        # default (team.metadata["team_member_budget_id"]).
+        team_member_budget: Optional[float] = None
+        if team_membership is not None and team_membership.litellm_budget_table is not None:
             team_member_budget = team_membership.litellm_budget_table.max_budget
-            team_member_spend = team_membership.spend or 0.0
+
+        if team_member_budget is None and prisma_client is not None:
+            default_budget_id = (team_object.metadata or {}).get("team_member_budget_id")
+            if isinstance(default_budget_id, str):
+                cache_key = f"team_member_default_budget:{default_budget_id}"
+                team_member_budget = await user_api_key_cache.async_get_cache(key=cache_key)
+                if team_member_budget is None:
+                    budget_row = await prisma_client.db.litellm_budgettable.find_unique(
+                        where={"budget_id": default_budget_id}
+                    )
+                    if budget_row is not None:
+                        team_member_budget = budget_row.max_budget
+                        await user_api_key_cache.async_set_cache(
+                            key=cache_key, value=team_member_budget
+                        )
+
+        if team_member_budget is not None and team_member_budget > 0:
+            team_member_spend = (
+                team_membership.spend if team_membership is not None else 0.0
+            ) or 0.0
 
             # Read from cross-pod counter (Redis-first) if available
             from litellm.proxy.proxy_server import get_current_spend

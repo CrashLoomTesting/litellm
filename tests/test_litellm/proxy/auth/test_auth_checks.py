@@ -1795,3 +1795,158 @@ async def test_team_member_budget_check_reads_from_spend_counter():
                 proxy_logging_obj=proxy_logging_obj,
             )
         assert exc_info.value.current_cost == 1.5
+
+
+@pytest.mark.asyncio
+async def test_team_member_budget_check_falls_back_to_team_default_budget_id():
+    """When a member's TeamMembership has no linked budget row, the check
+    should fall back to team.metadata["team_member_budget_id"] and still
+    enforce the cap. Pre-fix, this path silently skipped enforcement."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy._types import LiteLLM_TeamMembership
+    from litellm.proxy.utils import ProxyLogging
+
+    team_object = LiteLLM_TeamTable(
+        team_id="test-team",
+        metadata={"team_member_budget_id": "budget-default"},
+    )
+    user_object = LiteLLM_UserTable(user_id="test-user")
+    valid_token = UserAPIKeyAuth(
+        token="test-token",
+        user_id="test-user",
+        team_id="test-team",
+    )
+
+    # Membership row without an attached budget — the pre-fix silent-skip case.
+    team_membership = LiteLLM_TeamMembership(
+        user_id="test-user",
+        team_id="test-team",
+        spend=0.0,
+        budget_id=None,
+        litellm_budget_table=None,
+    )
+
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=None)
+
+    fake_budget_row = MagicMock()
+    fake_budget_row.max_budget = 50.0
+    fake_budget_row.dict = MagicMock(
+        return_value={"budget_id": "budget-default", "max_budget": 50.0}
+    )
+
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_budgettable.find_unique = AsyncMock(
+        return_value=fake_budget_row
+    )
+
+    async def mock_get_current_spend(counter_key, fallback_spend):
+        if counter_key == "spend:team_member:test-user:test-team":
+            return 70.0
+        return fallback_spend
+
+    user_api_key_cache = DualCache()
+
+    with (
+        patch("litellm.proxy.proxy_server.get_current_spend", mock_get_current_spend),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=team_membership,
+        ),
+    ):
+        with pytest.raises(litellm.BudgetExceededError) as exc_info:
+            await _check_team_member_budget(
+                team_object=team_object,
+                user_object=user_object,
+                valid_token=valid_token,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+        assert exc_info.value.current_cost == 70.0
+        assert exc_info.value.max_budget == 50.0
+
+    # Second call hits the cached budget row — no additional prisma read.
+    prisma_client.db.litellm_budgettable.find_unique.reset_mock()
+    with (
+        patch("litellm.proxy.proxy_server.get_current_spend", mock_get_current_spend),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=team_membership,
+        ),
+    ):
+        with pytest.raises(litellm.BudgetExceededError):
+            await _check_team_member_budget(
+                team_object=team_object,
+                user_object=user_object,
+                valid_token=valid_token,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+    assert prisma_client.db.litellm_budgettable.find_unique.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_team_member_budget_check_per_member_override_wins_over_team_default():
+    """If a member has a per-member budget AND the team carries a
+    team_member_budget_id default, the per-member value wins and the
+    fallback prisma lookup is never performed."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_TeamMembership
+    from litellm.proxy.utils import ProxyLogging
+
+    team_object = LiteLLM_TeamTable(
+        team_id="test-team",
+        metadata={"team_member_budget_id": "budget-default"},
+    )
+    user_object = LiteLLM_UserTable(user_id="test-user")
+    valid_token = UserAPIKeyAuth(
+        token="test-token",
+        user_id="test-user",
+        team_id="test-team",
+    )
+
+    team_membership = LiteLLM_TeamMembership(
+        user_id="test-user",
+        team_id="test-team",
+        spend=0.0,
+        budget_id="budget-override",
+        litellm_budget_table=LiteLLM_BudgetTable(max_budget=200.0),
+    )
+
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=None)
+
+    # Team default would block at $50; if the fallback fired, this raises.
+    fake_budget_row = MagicMock()
+    fake_budget_row.max_budget = 50.0
+
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_budgettable.find_unique = AsyncMock(
+        return_value=fake_budget_row
+    )
+
+    async def mock_get_current_spend(counter_key, fallback_spend):
+        if counter_key == "spend:team_member:test-user:test-team":
+            return 70.0
+        return fallback_spend
+
+    with (
+        patch("litellm.proxy.proxy_server.get_current_spend", mock_get_current_spend),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=team_membership,
+        ),
+    ):
+        await _check_team_member_budget(
+            team_object=team_object,
+            user_object=user_object,
+            valid_token=valid_token,
+            prisma_client=prisma_client,
+            user_api_key_cache=DualCache(),
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+    prisma_client.db.litellm_budgettable.find_unique.assert_not_awaited()

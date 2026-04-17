@@ -4965,3 +4965,61 @@ async def test_increment_spend_counters_team_and_member():
     finally:
         ps.user_api_key_cache = original_key_cache
         ps.spend_counter_cache = original_counter_cache
+
+
+@pytest.mark.asyncio
+async def test_increment_spend_counters_uses_long_ttl_on_redis_writes():
+    """Counter writes must carry ttl=2592000 (30 days). Redis's default of
+    60s caused the counter to expire mid-cycle and re-seed from stale
+    cached spend, producing incorrect budget usage counts."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy._types import LiteLLM_VerificationTokenView, hash_token
+
+    key_cache = DualCache()
+    counter_cache = DualCache()
+
+    hashed_token = hash_token("sk-ttl-test-token")
+    key_cache.in_memory_cache.set_cache(
+        key=hashed_token,
+        value=LiteLLM_VerificationTokenView(
+            token=hashed_token, spend=0.0, max_budget=10.0
+        ),
+    )
+
+    recorded_increments: list = []
+
+    async def record_increment(key, value, ttl=None, **kwargs):
+        recorded_increments.append({"key": key, "value": value, "ttl": ttl})
+        return value
+
+    fake_redis = AsyncMock()
+    fake_redis.async_increment = AsyncMock(side_effect=record_increment)
+    fake_redis.async_get_cache = AsyncMock(return_value=None)
+    counter_cache.redis_cache = fake_redis
+
+    import litellm.proxy.proxy_server as ps
+
+    original_key_cache = ps.user_api_key_cache
+    original_counter_cache = ps.spend_counter_cache
+    ps.user_api_key_cache = key_cache
+    ps.spend_counter_cache = counter_cache
+
+    try:
+        from litellm.proxy.proxy_server import increment_spend_counters
+
+        await increment_spend_counters(
+            token=hashed_token,
+            team_id="team-1",
+            user_id="user-1",
+            response_cost=0.05,
+        )
+
+        assert recorded_increments, "expected at least one redis increment"
+        for call in recorded_increments:
+            assert call["ttl"] == 2592000, (
+                f"expected ttl=2592000 on every counter write, "
+                f"got ttl={call['ttl']} on key={call['key']}"
+            )
+    finally:
+        ps.user_api_key_cache = original_key_cache
+        ps.spend_counter_cache = original_counter_cache

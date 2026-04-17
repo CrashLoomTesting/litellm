@@ -1912,10 +1912,12 @@ async def _init_and_increment_spend_counter(
                 base_spend = getattr(source, "spend", 0.0) or 0.0
         if base_spend > 0:
             await spend_counter_cache.async_increment_cache(
-                key=counter_key, value=base_spend
+                key=counter_key, value=base_spend, ttl=2592000  # 30 days
             )
 
-    await spend_counter_cache.async_increment_cache(key=counter_key, value=increment)
+    await spend_counter_cache.async_increment_cache(
+        key=counter_key, value=increment, ttl=2592000  # 30 days
+    )
 
 
 async def update_cache(  # noqa: PLR0915
