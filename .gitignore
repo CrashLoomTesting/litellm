@@ -95,4 +95,4 @@ test.py
 litellm_config.yaml
 .cursor
 .vscode/launch.json
-litellm/proxy/to_delete_loadtest_work/*
+litellm/proxy/to_delete_loadtest_work/*.crashloom/agent/
