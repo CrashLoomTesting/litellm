@@ -832,7 +832,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             litellm_parent_otel_span: Union[Span, None] = (
                 _get_parent_otel_span_from_kwargs(kwargs)
             )
-            user_api_key = kwargs["litellm_params"]["metadata"].get("user_api_key")
+            # Defensive access: litellm_params or metadata can be None in failure paths
+            litellm_params = (kwargs.get("litellm_params") or {})
+            metadata = litellm_params.get("metadata") or {}
+            user_api_key = metadata.get("user_api_key")
             pipeline_operations: List[RedisPipelineIncrementOperation] = []
 
             if user_api_key:
